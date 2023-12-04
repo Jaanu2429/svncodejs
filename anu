@@ -1,1 +1,134 @@
-anu
+const AWS = require('aws-sdk');
+
+exports.handler = async (event, context) => {
+    // Log the entire incoming event
+    console.log("Received event: " + JSON.stringify(event, null, 2));
+
+    // Extract commit information from the event payload
+    const body = JSON.parse(event.body || '{}');
+    console.log("Webhook payload body:", body);
+
+    // Extract relevant parameters
+    const repositoryName = body.repository?.name || 'Unknown Repository Name';
+
+    // Extract commit information
+    const commitId = body.head_commit?.id || 'Unknown Commit ID';
+    const pushedBranch = (body.ref || 'Unknown Ref').replace('refs/heads/', '') || 'Unknown Pushed Branch';
+
+    // Create the repository if it doesn't exist
+    await createRepository(repositoryName);
+
+    // Commit the Lambda function code to CodeCommit
+    const commitIdCreated = await pushLambdaCodeToCodeCommit(repositoryName, pushedBranch, commitId, body);
+
+    // Your webhook processing logic goes here
+
+    // Print the commit ID
+    console.log(`Commit ID: ${commitIdCreated}`);
+
+    // Return a response, if needed
+    return {
+        statusCode: 200,
+        body: JSON.stringify('Webhook invoked successfully!')
+    };
+};
+
+async function createRepository(repositoryName) {
+    try {
+        // Create a CodeCommit client
+        const codecommit = new AWS.CodeCommit();
+
+        // Create the CodeCommit repository
+        await codecommit.createRepository({ repositoryName }).promise();
+
+        console.log(`Repository '${repositoryName}' created successfully.`);
+    } catch (error) {
+        if (error.code === 'RepositoryNameExistsException') {
+            console.log(`Repository '${repositoryName}' already exists.`);
+        } else {
+            console.log(`Error creating repository: ${error}`);
+        }
+    }
+}
+
+async function pushLambdaCodeToCodeCommit(repositoryName, branchName, commitId, body) {
+    try {
+        // Create a CodeCommit client
+        const codecommit = new AWS.CodeCommit();
+
+        // Check if the branch exists
+        const branches = (await codecommit.listBranches({ repositoryName }).promise()).branches;
+        if (!branches.includes(branchName)) {
+            // If the branch doesn't exist, create it
+            await codecommit.createBranch({ repositoryName, branchName }).promise();
+            console.log(`Branch '${branchName}' created successfully.`);
+        }
+
+        // Log parameter values before making the CodeCommit API call
+        console.log(`Repository Name: ${repositoryName}`);
+        console.log(`Branch Name: ${branchName}`);
+        console.log(`Webhook Commit ID: ${commitId}`);
+
+        // Get the latest commit ID for the branch
+        const latestCommitId = (await codecommit.getBranch({ repositoryName, branchName }).promise()).branch.commitId;
+
+        // Add these lines to help troubleshoot
+        console.log(`Latest Commit ID for branch '${branchName}': ${latestCommitId}`);
+
+        // Get the commit details from the webhook payload
+        const commitDetails = body.head_commit || {};
+
+        // Retrieve the commit message and code changes
+        const commitMessage = commitDetails.message || 'No commit message';
+        const codeChanges = (commitDetails.added || []).concat(commitDetails.modified || []);
+
+        // Create a commit with the actual code changes
+        const response = await codecommit.createCommit({
+            repositoryName,
+            branchName,
+            parentCommitId: latestCommitId,
+            authorName: commitDetails.author?.name || 'Unknown Author',
+            email: commitDetails.author?.email || 'unknown@example.com',
+            commitMessage: commitMessage,
+            putFiles: codeChanges.map(file => ({
+                filePath: file,
+                fileMode: 'NORMAL',
+                fileContent: getFileContent(file, body),
+            })),
+        }).promise();
+
+        const commitIdCreated = response.commitId;
+        console.log(`Code pushed successfully to branch '${branchName}'. Commit ID: ${commitIdCreated}`);
+
+        return commitIdCreated;
+    } catch (error) {
+        console.log(`Error pushing code to CodeCommit: ${error}`);
+        return null;
+    }
+}
+
+function getFileContent(filePath, body) {
+    try {
+        // Assuming body.head_commit.added and body.head_commit.modified are arrays or objects
+        const addedFiles = body.head_commit?.added || {};
+        const modifiedFiles = body.head_commit?.modified || {};
+
+        // Try to retrieve file content from added files
+        let fileContent = addedFiles[filePath];
+
+        // If not found in added files, try to retrieve from modified files
+        if (fileContent === undefined) {
+            fileContent = modifiedFiles[filePath];
+        }
+
+        // If still not found, return a placeholder message
+        if (fileContent === undefined) {
+            fileContent = 'File content not available';
+        }
+
+        return fileContent;
+    } catch (error) {
+        console.log(`Error getting file content: ${error}`);
+        return 'Error getting file content';
+    }
+}
